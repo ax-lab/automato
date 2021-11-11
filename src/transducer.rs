@@ -61,7 +61,7 @@ impl Transducer {
 
 		let state_id = |n: usize| {
 			let name = state_name(n);
-			quote! { S :: #name }
+			quote! { _S :: #name }
 		};
 
 		let mut states = Vec::new();
@@ -83,7 +83,7 @@ impl Transducer {
 					quote! {
 						#read_input
 						if input.is_none() {
-							self.state = S::End;
+							self.state = _S::End;
 							return None;
 						}
 					}
@@ -155,13 +155,21 @@ impl Transducer {
 			use ::std::option::Option;
 
 			#[derive(Copy, Clone)]
-			enum S {
+			enum _S {
 				#( #states, )*
 				End,
 			}
 
+			#[doc = r#"
+				Transducer that applies transformation rules to the input text.
+
+				The transducer takes the input as an [`Iterator<Item=char>`] and
+				implements that same trait to generate the output.
+
+				This is generated as raw rust code by a proc-macro.
+			"#]
 			pub struct Transducer<I: Iterator<Item = char>> {
-				state: S,
+				state: _S,
 				iter: I,
 			}
 
@@ -172,7 +180,7 @@ impl Transducer {
 					loop {
 						match self.state {
 							#( #program )*
-							End => {
+							_S::End => {
 								return None;
 							}
 						}
@@ -180,6 +188,13 @@ impl Transducer {
 				}
 			}
 
+			#[doc = r#"
+				Returns a new [`Transducer`] for the given input iterator.
+
+				The returned transducer implements [`Iterator<Item=char>`]
+				consuming the input characters one at a time and generating
+				the transformed output.
+			"#]
 			pub fn new<I: IntoIterator<Item = char>>(input: I) -> Transducer<I::IntoIter> {
 				Transducer { state: #start(None), iter: input.into_iter() }
 			}

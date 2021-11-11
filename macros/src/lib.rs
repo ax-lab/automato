@@ -4,6 +4,21 @@ use proc_macro2::Ident;
 use quote::quote;
 use syn::{parse::Parse, parse_macro_input, LitStr, Token};
 
+/// Generate a transducer as compiled code.
+///
+/// ## Example
+///
+/// ```
+/// # extern crate automato_macros;
+/// # use automato_macros::transducer;
+/// transducer!(some_name:
+///     "a" => "A",
+///     "b" => "B",
+///     "c" => "C",
+/// );
+/// let out = some_name::new("abc!".chars()).collect::<String>();
+/// assert_eq!(out, "ABC!");
+/// ```
 #[proc_macro]
 pub fn transducer(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as ParsedTransducer);
