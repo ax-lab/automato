@@ -1,3 +1,4 @@
+use automato_macros::transducer;
 use transducer_macro::{
 	transducer_basic, transducer_empty, transducer_empty_output, transducer_simple, transducer_tricky,
 };
@@ -155,4 +156,16 @@ fn transducer_tricky() {
 	assert_eq!(out, "(X)");
 	let out: String = t::new("(aababx)".chars()).collect();
 	assert_eq!(out, "(AX)");
+}
+
+#[test]
+fn with_macro() {
+	transducer!(basic:
+		"a" => "A",
+		"b" => "B",
+		"c" => "C",
+	);
+
+	let out: String = basic::new("abc!".chars()).collect();
+	assert_eq!(out, "ABC!");
 }

@@ -1,5 +1,5 @@
 [package]
-name = "transducer-macro"
+name = "automato-macros"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,9 +7,7 @@ edition = "2021"
 proc-macro = true
 
 [dependencies]
-automato = { path = "../../" }
-automato-macros = { path = "../../macros" }
+automato = { path = ".." }
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "1.0", features = ["full"] }
-trybuild = "1.0"
