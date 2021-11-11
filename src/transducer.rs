@@ -108,8 +108,8 @@ impl Transducer {
 							self.state = #next(char);
 						}
 					}
-					&Op::Push { char } => {
-						let next = state_id(n + 1);
+					&Op::Push { char, next } => {
+						let next = state_id(next);
 						quote! {
 							self.state = #next(char);
 							return Some(#char);
@@ -152,6 +152,7 @@ impl Transducer {
 			.collect();
 
 		quote! {
+			use ::std::iter::Iterator;
 			use ::std::option::Option;
 
 			#[derive(Copy, Clone)]
@@ -261,8 +262,8 @@ impl<'a, S: Iterator<Item = char>> Iterator for TransducerIter<'a, S> {
 						self.counter = *fail;
 					}
 				}
-				Op::Push { char } => {
-					self.counter += 1;
+				Op::Push { char, next } => {
+					self.counter = *next;
 					return Some(*char);
 				}
 				Op::Char => {
@@ -286,7 +287,7 @@ impl<'a, S: Iterator<Item = char>> TransducerIter<'a, S> {
 #[derive(Debug)]
 enum Op {
 	/// Outputs a single character and moves to the next operation.
-	Push { char: char },
+	Push { char: char, next: usize },
 	/// Tries to read the given char from input. Moves to `next` if successful,
 	/// otherwise moves to `fail`.
 	Read { char: char, next: usize, fail: usize },
@@ -295,14 +296,14 @@ enum Op {
 	Test { table: HashMap<char, usize>, fail: usize },
 	/// Unconditional jump to the given operation.
 	Jump { next: usize },
-	/// Emits the current input character.
+	/// Emits the current input character and resets.
 	Char,
 }
 
 impl std::fmt::Display for Op {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Op::Push { char } => write!(f, "PUSH '{}'", char),
+			Op::Push { char, next } => write!(f, "PUSH '{}' THEN {:04}", char, next),
 			Op::Read { char, next, fail } => write!(f, "READ '{}': {:04} ELSE {:04}", char, next, fail),
 			Op::Jump { next } => write!(f, "JUMP {:04}", next),
 			Op::Char => write!(f, "CHAR"),
@@ -384,6 +385,71 @@ impl Builder {
 			}
 		}
 
+		//--------------------------------------------------------------------//
+		// Optimization
+		//--------------------------------------------------------------------//
+
+		//----[ Remove jumps ]------------------------------------------------//
+
+		// Replace all incondicional jumps with the direct target of the jump.
+
+		// If a offset is a jump instruction, this will contain the target of
+		// the jump at that offset.
+		let mut jump_target: HashMap<usize, usize> = HashMap::new();
+		// Number of jumps before the given operation offset. This is used to
+		// translate all operation targets after removing the jumps.
+		let mut jump_offset: Vec<usize> = Vec::new();
+
+		let mut offset = 0;
+		for (index, op) in program.iter().enumerate() {
+			jump_offset.push(offset);
+			if let Op::Jump { next } = op {
+				jump_target.insert(index, *next);
+				offset += 1;
+			}
+		}
+
+		// Takes a target offset and compute the actual offset after removing
+		// all jumps from the code.
+		let jump_target = move |mut next: usize| -> usize {
+			// while the target is a jump, translate to the jump target
+			while let Some(n) = jump_target.get(&next) {
+				next = *n;
+			}
+			// apply the offset at the target after removing all jumps
+			next - jump_offset[next]
+		};
+
+		// Translate all offsets in the program.
+		for op in program.iter_mut() {
+			match op {
+				Op::Char { .. } => {}
+				Op::Jump { .. } => {}
+
+				Op::Push { next, .. } => {
+					*next = jump_target(*next);
+				}
+				Op::Read { fail, next, char: _ } => {
+					*fail = jump_target(*fail);
+					*next = jump_target(*next);
+				}
+				Op::Test { table, fail } => {
+					*fail = jump_target(*fail);
+					for (_, next) in table.iter_mut() {
+						*next = jump_target(*next);
+					}
+				}
+			}
+		}
+
+		let start = jump_target(start);
+
+		// Filter out jump instructions.
+		program = program
+			.into_iter()
+			.filter(|op| if let Op::Jump { .. } = op { false } else { true })
+			.collect();
+
 		Transducer { start, program }
 	}
 
@@ -456,7 +522,8 @@ impl Builder {
 		let consumed_input = if let Some(output) = valid_output {
 			// generate the valid output up to this state
 			for char in output.chars() {
-				out.push(Op::Push { char });
+				let next = out.len() + 1;
+				out.push(Op::Push { char, next });
 			}
 			// we will re-evaluate the unprocessed characters after the valid
 			// output
@@ -464,7 +531,8 @@ impl Builder {
 		} else if let Some(char) = input.chars().next() {
 			// if there is no valid output, but we have consumed some input,
 			// emit a single input character and re-evaluate the rest
-			out.push(Op::Push { char });
+			let next = out.len() + 1;
+			out.push(Op::Push { char, next });
 			char.len_utf8()
 		} else {
 			// there is no valid output and we also did not consume any input
@@ -479,7 +547,8 @@ impl Builder {
 		let (output, state_index) = self.run_machine(&input[consumed_input..], false);
 
 		for char in output.chars() {
-			out.push(Op::Push { char });
+			let next = out.len() + 1;
+			out.push(Op::Push { char, next });
 		}
 
 		// generate the jump with the state index, since we may not have that
