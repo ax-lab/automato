@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+
 /// Transducer for fast text-to-text transformation without backtracking.
 ///
 /// To create a transducer use a [`Builder`].
@@ -32,6 +35,154 @@ impl Transducer {
 			input: input.into_iter(),
 			counter: self.start,
 			current: None,
+		}
+	}
+
+	/// Returns a [`TokenStream`] containing rust code equivalent to the
+	/// transducer.
+	///
+	/// This is meant to be used by a `proc_macro` to generate a transducer
+	/// as raw rust code.
+	///
+	/// The generated code is meant to be used inside a module defined by the
+	/// caller. The generated module contains two public symbols: `Transducer`
+	/// and `new`.
+	///
+	/// `Transducer` is a struct and `new` is a generic constructor function
+	/// with type `fn(T) -> Transducer`, where `T` is [`IntoIterator<Item=char>`].
+	///
+	/// The `Transducer` holds the input as an [`Iterator<Item=char>`] and
+	/// itself implements an [`Iterator`] that generates the output chars.
+	pub fn to_tokens(&self) -> TokenStream {
+		let state_name = |n: usize| {
+			let name = format_ident!("State{}", n);
+			name
+		};
+
+		let state_id = |n: usize| {
+			let name = state_name(n);
+			quote! { S :: #name }
+		};
+
+		let mut states = Vec::new();
+		let start = state_id(self.start);
+		let program: Vec<_> = self
+			.program
+			.iter()
+			.enumerate()
+			.map(|(n, op)| {
+				let is_start = n == self.start;
+				let read_input = quote! {
+					let input = if char.is_some() {
+						char
+					} else {
+						self.iter.next()
+					};
+				};
+				let read_input = if is_start {
+					quote! {
+						#read_input
+						if input.is_none() {
+							self.state = S::End;
+							return None;
+						}
+					}
+				} else {
+					read_input
+				};
+
+				let current = state_id(n);
+				let current_name = state_name(n);
+				states.push(quote! { #current_name (Option<char>) });
+				let op = match op {
+					&Op::Char => {
+						quote! {
+							#read_input
+							self.state = #start(None);
+							return input;
+						}
+					}
+					&Op::Jump { next } => {
+						let next = state_id(next);
+						quote! {
+							self.state = #next(char);
+						}
+					}
+					&Op::Push { char } => {
+						let next = state_id(n + 1);
+						quote! {
+							self.state = #next(char);
+							return Some(#char);
+						}
+					}
+					&Op::Read { char, next, fail } => {
+						let next = state_id(next);
+						let fail = state_id(fail);
+						quote! {
+							#read_input
+							self.state = if input == Some(#char) { #next(None) } else { #fail(input) };
+						}
+					}
+					Op::Test { table, fail } => {
+						let fail = state_id(*fail);
+						let mut next = table.iter().collect::<Vec<_>>();
+						next.sort();
+						let next = next
+							.into_iter()
+							.map(|(char, next)| {
+								let next = state_id(*next);
+								quote! {
+									Some(#char) => #next(None),
+								}
+							})
+							.collect::<Vec<_>>();
+						quote! {
+							#read_input
+							self.state = match input {
+								#( #next )*
+								input => #fail(input),
+							}
+						}
+					}
+				};
+				quote! {
+					#current(char) => { #op }
+				}
+			})
+			.collect();
+
+		quote! {
+			use ::std::option::Option;
+
+			#[derive(Copy, Clone)]
+			enum S {
+				#( #states, )*
+				End,
+			}
+
+			pub struct Transducer<I: Iterator<Item = char>> {
+				state: S,
+				iter: I,
+			}
+
+			impl<I: Iterator<Item = char>> Iterator for Transducer<I> {
+				type Item = char;
+
+				fn next(&mut self) -> Option<Self::Item> {
+					loop {
+						match self.state {
+							#( #program )*
+							End => {
+								return None;
+							}
+						}
+					}
+				}
+			}
+
+			pub fn new<I: IntoIterator<Item = char>>(input: I) -> Transducer<I::IntoIter> {
+				Transducer { state: #start(None), iter: input.into_iter() }
+			}
 		}
 	}
 }
@@ -263,9 +414,10 @@ impl Builder {
 			}
 			_ => {
 				// multiple transition case
-				let table = state
-					.next
-					.iter()
+				let mut table = state.next.iter().collect::<Vec<_>>();
+				table.sort();
+				let table = table
+					.into_iter()
 					.map(|(&char, &next)| {
 						input.push(char);
 						let next = self.compile_subtree(out, next, valid_output, valid_input, input, state_map);
@@ -460,7 +612,7 @@ mod tests {
 	}
 
 	#[test]
-	fn transducer_simple() {
+	fn transducer_basic() {
 		let mut b = Builder::new();
 		b.add("a", "A");
 		b.add("b", "B");
@@ -477,6 +629,20 @@ mod tests {
 		assert_eq!(t.parse_str("~abc"), "~ABC");
 		assert_eq!(t.parse_str("abc~"), "ABC~");
 		assert_eq!(t.parse_str("(abc)(aa)(bb)(cc)"), "(ABC)(AA)(BB)(CC)");
+	}
+
+	#[test]
+	fn transducer_simple() {
+		let mut b = Builder::new();
+		b.add("a", "A");
+		b.add("b", "B");
+		b.add("ab", "C");
+
+		assert_eq!(b.simulate("aabbabab123"), "ACBCC123");
+
+		let t = b.compile();
+		println!("{}", t);
+		assert_eq!(t.parse_str("aabbabab123"), "ACBCC123");
 	}
 
 	#[test]
@@ -532,8 +698,6 @@ mod tests {
 		b.add("aaaaaa", "Y");
 
 		let t = b.compile();
-
-		println!("{}", t);
 
 		// non-matches
 		assert_eq!(t.parse_str(""), "");
