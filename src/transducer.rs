@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -389,38 +389,32 @@ impl Builder {
 		// Optimization
 		//--------------------------------------------------------------------//
 
-		//----[ Remove jumps ]------------------------------------------------//
+		//----| Remove jumps |------------------------------------------------//
 
-		// Replace all incondicional jumps with the direct target of the jump.
+		// This will replace all incondicional jumps with the direct target of
+		// the jump.
 
-		// If a offset is a jump instruction, this will contain the target of
-		// the jump at that offset.
+		// if the index is a jump instruction, this will contain the target of
+		// the jump at that index
 		let mut jump_target: HashMap<usize, usize> = HashMap::new();
-		// Number of jumps before the given operation offset. This is used to
-		// translate all operation targets after removing the jumps.
-		let mut jump_offset: Vec<usize> = Vec::new();
-
-		let mut offset = 0;
 		for (index, op) in program.iter().enumerate() {
-			jump_offset.push(offset);
 			if let Op::Jump { next } = op {
 				jump_target.insert(index, *next);
-				offset += 1;
 			}
 		}
 
-		// Takes a target offset and compute the actual offset after removing
-		// all jumps from the code.
+		// takes a target offset and compute the new target after going through
+		// any incondicional jumps
 		let jump_target = move |mut next: usize| -> usize {
 			// while the target is a jump, translate to the jump target
 			while let Some(n) = jump_target.get(&next) {
 				next = *n;
 			}
-			// apply the offset at the target after removing all jumps
-			next - jump_offset[next]
+			next
 		};
 
-		// Translate all offsets in the program.
+		// translate all jump offsets in the program
+		let start = jump_target(start);
 		for op in program.iter_mut() {
 			match op {
 				Op::Char { .. } => {}
@@ -442,13 +436,86 @@ impl Builder {
 			}
 		}
 
-		let start = jump_target(start);
+		//----| Remove unused ops |-------------------------------------------//
 
-		// Filter out jump instructions.
+		// ~ Flag used ops ~
+
+		// breadth-first search starting at the initial state
+		let mut used: HashSet<usize> = HashSet::new();
+		let mut queue: VecDeque<usize> = VecDeque::new();
+		queue.push_back(start);
+		while let Some(index) = queue.pop_front() {
+			if used.insert(index) {
+				match &program[index] {
+					Op::Char { .. } => {}
+					Op::Jump { next } => {
+						queue.push_back(*next);
+					}
+					Op::Push { next, .. } => {
+						queue.push_back(*next);
+					}
+					Op::Read { fail, next, char: _ } => {
+						queue.push_back(*next);
+						queue.push_back(*fail);
+					}
+					Op::Test { table, fail } => {
+						queue.push_back(*fail);
+						for (_, next) in table.iter() {
+							queue.push_back(*next);
+						}
+					}
+				}
+			}
+		}
+
+		// ~ Compute the new offset for each operation index ~
+
+		// number of unused operations before a given index
+		let mut unused_count: Vec<usize> = Vec::with_capacity(program.len());
+		let mut unused = 0;
+		for index in 0..program.len() {
+			unused_count.push(unused);
+			if !used.contains(&index) {
+				unused += 1;
+			}
+		}
+
+		// adjust the targets of each operation based on the to be removed
+		// unused operations' offset
+		let start = start - unused_count[start];
+		for op in program.iter_mut() {
+			match op {
+				Op::Char { .. } => {}
+				Op::Jump { next } => {
+					*next -= unused_count[*next];
+				}
+
+				Op::Push { next, .. } => {
+					*next -= unused_count[*next];
+				}
+				Op::Read { fail, next, char: _ } => {
+					*fail -= unused_count[*fail];
+					*next -= unused_count[*next];
+				}
+				Op::Test { table, fail } => {
+					*fail -= unused_count[*fail];
+					for (_, next) in table.iter_mut() {
+						*next -= unused_count[*next];
+					}
+				}
+			}
+		}
+
+		// ~ Remove unused ~
+
 		program = program
 			.into_iter()
-			.filter(|op| if let Op::Jump { .. } = op { false } else { true })
+			.enumerate()
+			.filter(|(index, _)| if used.contains(index) { true } else { false })
+			.map(|x| x.1)
 			.collect();
+
+		//--------------------------------------------------------------------//
 
 		Transducer { start, program }
 	}
