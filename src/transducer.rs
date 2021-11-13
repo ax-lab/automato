@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+	collections::{HashMap, HashSet, VecDeque},
+	fmt::Display,
+};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -64,17 +67,21 @@ impl Transducer {
 			quote! { _S :: #name }
 		};
 
-		let mut states = Vec::new();
 		let start = state_id(self.start);
+
+		let mut states = Vec::new();
 		let program: Vec<_> = self
 			.program
 			.iter()
 			.enumerate()
-			.map(|(n, op)| {
-				let is_start = n == self.start;
+			.map(|(index, op)| {
+				let is_start = index == self.start;
+
+				// segment of code to read the next input to `input`
 				let read_input = quote! {
-					let input = if char.is_some() {
-						char
+					let input = if let Some(char) = self.next {
+						self.next = None;
+						Some(char)
 					} else {
 						self.iter.next()
 					};
@@ -91,62 +98,103 @@ impl Transducer {
 					read_input
 				};
 
-				let current = state_id(n);
-				let current_name = state_name(n);
-				states.push(quote! { #current_name (Option<char>) });
+				// segment of code to undo the last input read
+				let undo_input = quote! {
+					self.next = input;
+				};
+
+				// generate the code for a transition action
+				let action = |action: Action| match action {
+					Action::Char(char) => {
+						if index == self.start {
+							quote! {
+								return Some(#char);
+							}
+						} else {
+							quote! {
+								self.state = #start;
+								return Some(#char);
+							}
+						}
+					}
+					Action::Next(next) => {
+						if next == index {
+							quote! {}
+						} else {
+							let next = state_id(next);
+							quote! {
+								self.state = #next;
+							}
+						}
+					}
+				};
+
+				// generate the code for the current operation
+
+				let current = state_id(index);
+				let current_name = state_name(index);
+				states.push(quote! { #current_name });
 				let op = match op {
 					&Op::Char => {
 						quote! {
 							#read_input
-							self.state = #start(None);
+							self.state = #start;
 							return input;
 						}
 					}
 					&Op::Jump { next } => {
 						let next = state_id(next);
 						quote! {
-							self.state = #next(char);
+							self.state = #next;
 						}
 					}
 					&Op::Push { char, next } => {
 						let next = state_id(next);
 						quote! {
-							self.state = #next(char);
+							self.state = #next;
 							return Some(#char);
 						}
 					}
 					&Op::Read { char, next, fail } => {
-						let next = state_id(next);
-						let fail = state_id(fail);
+						let next = action(next);
+						let fail = action(fail);
 						quote! {
 							#read_input
-							self.state = if input == Some(#char) { #next(None) } else { #fail(input) };
+							if input == Some(#char) {
+								#next
+							} else {
+								#undo_input
+								#fail
+							};
 						}
 					}
 					Op::Test { table, fail } => {
-						let fail = state_id(*fail);
+						let fail = action(*fail);
 						let mut next = table.iter().collect::<Vec<_>>();
 						next.sort();
 						let next = next
 							.into_iter()
 							.map(|(char, next)| {
-								let next = state_id(*next);
+								let next = action(*next);
 								quote! {
-									Some(#char) => #next(None),
+									Some(#char) => { #next }
 								}
 							})
 							.collect::<Vec<_>>();
 						quote! {
 							#read_input
-							self.state = match input {
+							match input {
 								#( #next )*
-								input => #fail(input),
+								input => {
+									#undo_input
+									#fail
+								}
 							}
 						}
 					}
 				};
 				quote! {
-					#current(char) => { #op }
+					#current => { #op }
 				}
 			})
 			.collect();
@@ -172,6 +220,7 @@ impl Transducer {
 			pub struct Transducer<I: Iterator<Item = char>> {
 				state: _S,
 				iter: I,
+				next: Option<char>,
 			}
 
 			impl<I: Iterator<Item = char>> Iterator for Transducer<I> {
@@ -197,7 +246,7 @@ impl Transducer {
 				the transformed output.
 			"#]
 			pub fn new<I: IntoIterator<Item = char>>(input: I) -> Transducer<I::IntoIter> {
-				Transducer { state: #start(None), iter: input.into_iter() }
+				Transducer { state: #start, iter: input.into_iter(), next: None }
 			}
 		}
 	}
@@ -232,34 +281,83 @@ impl<'a, S: Iterator<Item = char>> Iterator for TransducerIter<'a, S> {
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let program = &self.parent.program;
+		let start = self.parent.start;
 		loop {
 			match &program[self.counter] {
 				Op::Test { table, fail } => {
 					let next_input = self.read();
 					if let Some(next_input) = next_input {
 						if let Some(next) = table.get(&next_input) {
-							self.counter = *next;
+							match next {
+								Action::Next(next) => {
+									self.counter = *next;
+								}
+								Action::Char(char) => {
+									self.counter = start;
+									return Some(*char);
+								}
+							}
 						} else {
 							self.current = Some(next_input);
-							self.counter = *fail;
+							match fail {
+								Action::Next(fail) => {
+									self.counter = *fail;
+								}
+								Action::Char(char) => {
+									self.counter = start;
+									return Some(*char);
+								}
+							}
 						}
 					} else {
 						self.current = None;
-						self.counter = *fail;
+						match fail {
+							Action::Next(fail) => {
+								self.counter = *fail;
+							}
+							Action::Char(char) => {
+								self.counter = start;
+								return Some(*char);
+							}
+						}
 					}
 				}
 				Op::Read { char, next, fail } => {
 					let next_input = self.read();
 					if let Some(next_input) = next_input {
 						if next_input == *char {
-							self.counter = *next;
+							match next {
+								Action::Next(next) => {
+									self.counter = *next;
+								}
+								Action::Char(char) => {
+									self.counter = start;
+									return Some(*char);
+								}
+							}
 						} else {
 							self.current = Some(next_input);
-							self.counter = *fail;
+							match fail {
+								Action::Next(fail) => {
+									self.counter = *fail;
+								}
+								Action::Char(char) => {
+									self.counter = start;
+									return Some(*char);
+								}
+							}
 						}
 					} else {
 						self.current = None;
-						self.counter = *fail;
+						match fail {
+							Action::Next(fail) => {
+								self.counter = *fail;
+							}
+							Action::Char(char) => {
+								self.counter = start;
+								return Some(*char);
+							}
+						}
 					}
 				}
 				Op::Push { char, next } => {
@@ -284,23 +382,43 @@ impl<'a, S: Iterator<Item = char>> TransducerIter<'a, S> {
 	}
 }
 
+/// Transducer operation.
 #[derive(Debug)]
 enum Op {
 	/// Outputs a single character and moves to the next operation.
 	Push { char: char, next: usize },
 	/// Tries to read the given char from input. Moves to `next` if successful,
 	/// otherwise moves to `fail`.
-	Read { char: char, next: usize, fail: usize },
+	Read { char: char, next: Action, fail: Action },
 	/// Test the next input character against the given table. Moves to the
 	/// corresponding operation if successful, otherwise moves to `fail`.
-	Test { table: HashMap<char, usize>, fail: usize },
+	Test { table: HashMap<char, Action>, fail: Action },
 	/// Unconditional jump to the given operation.
 	Jump { next: usize },
 	/// Emits the current input character and resets.
 	Char,
 }
 
-impl std::fmt::Display for Op {
+/// Represents a transition action for an [`Op`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum Action {
+	/// Moves to the given state.
+	Next(usize),
+	/// Generates a single output character and reset. This is specifically
+	/// to optimize the common case of outputing a single character.
+	Char(char),
+}
+
+impl Display for Action {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			&Action::Char(char) => write!(f, "'{}'", char),
+			&Action::Next(next) => write!(f, "{:04}", next),
+		}
+	}
+}
+
+impl Display for Op {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Op::Push { char, next } => write!(f, "PUSH '{}' THEN {:04}", char, next),
@@ -330,6 +448,9 @@ impl std::fmt::Display for Op {
 pub struct Builder {
 	states: Vec<BuilderState>,
 }
+
+// TODO: optimize jumps from matching states to states that generate a single
+// character and revert to the initial state
 
 impl Builder {
 	/// Returns a new empty [`Builder`] instance.
@@ -389,6 +510,63 @@ impl Builder {
 		// Optimization
 		//--------------------------------------------------------------------//
 
+		/// Applies a transformation to every transition target in the program.
+		fn transform_target<F: Fn(usize) -> usize>(program: &mut Vec<Op>, transform: F) {
+			for op in program.iter_mut() {
+				match op {
+					Op::Char { .. } => {}
+					Op::Jump { .. } => {}
+
+					Op::Push { next, .. } => {
+						*next = transform(*next);
+					}
+					Op::Read { fail, next, char: _ } => {
+						if let Action::Next(next) = next {
+							*next = transform(*next);
+						}
+						if let Action::Next(fail) = fail {
+							*fail = transform(*fail);
+						}
+					}
+					Op::Test { table, fail } => {
+						if let Action::Next(fail) = fail {
+							*fail = transform(*fail);
+						}
+						for (_, next) in table.iter_mut() {
+							if let Action::Next(next) = next {
+								*next = transform(*next);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		/// Applies a transformation to every transition action in the program.
+		///
+		/// This only affect the actions in [`Op::Read`] and [`Op::Test`] which
+		/// allow actions.
+		fn transform_action<F: Fn(Action) -> Action>(program: &mut Vec<Op>, transform: F) {
+			for op in program.iter_mut() {
+				match op {
+					Op::Char { .. } => {}
+					Op::Jump { .. } => {}
+					Op::Push { .. } => {}
+
+					Op::Read { fail, next, char: _ } => {
+						*next = transform(*next);
+						*fail = transform(*fail);
+					}
+					Op::Test { table, fail } => {
+						*fail = transform(*fail);
+						for (_, next) in table.iter_mut() {
+							*next = transform(*next);
+						}
+					}
+				}
+			}
+		}
+
 		//----| Remove jumps |------------------------------------------------//
 
 		// This will replace all incondicional jumps with the direct target of
@@ -415,26 +593,36 @@ impl Builder {
 
 		// translate all jump offsets in the program
 		let start = jump_target(start);
-		for op in program.iter_mut() {
-			match op {
-				Op::Char { .. } => {}
-				Op::Jump { .. } => {}
+		transform_target(&mut program, jump_target);
 
-				Op::Push { next, .. } => {
-					*next = jump_target(*next);
-				}
-				Op::Read { fail, next, char: _ } => {
-					*fail = jump_target(*fail);
-					*next = jump_target(*next);
-				}
-				Op::Test { table, fail } => {
-					*fail = jump_target(*fail);
-					for (_, next) in table.iter_mut() {
-						*next = jump_target(*next);
+		//----| Replace single-output states |--------------------------------//
+
+		// Find states that generate a single output character and move to the
+		// start and replace with a direct output action.
+
+		let end_target = program
+			.iter()
+			.enumerate()
+			.filter_map(|(index, op)| {
+				if let Op::Push { next, char } = op {
+					if *next == start {
+						return Some((index, *char));
 					}
 				}
+				None
+			})
+			.collect::<HashMap<_, _>>();
+
+		let end_target = move |action: Action| -> Action {
+			if let Action::Next(next) = action {
+				if let Some(char) = end_target.get(&next) {
+					return Action::Char(*char);
+				}
 			}
-		}
+			action
+		};
+
+		transform_action(&mut program, end_target);
 
 		//----| Remove unused ops |-------------------------------------------//
 
@@ -455,13 +643,21 @@ impl Builder {
 						queue.push_back(*next);
 					}
 					Op::Read { fail, next, char: _ } => {
-						queue.push_back(*next);
-						queue.push_back(*fail);
+						if let Action::Next(next) = next {
+							queue.push_back(*next);
+						}
+						if let Action::Next(fail) = fail {
+							queue.push_back(*fail);
+						}
 					}
 					Op::Test { table, fail } => {
-						queue.push_back(*fail);
+						if let Action::Next(fail) = fail {
+							queue.push_back(*fail);
+						}
 						for (_, next) in table.iter() {
-							queue.push_back(*next);
+							if let Action::Next(next) = next {
+								queue.push_back(*next);
+							}
 						}
 					}
 				}
@@ -494,13 +690,21 @@ impl Builder {
 					*next -= unused_count[*next];
 				}
 				Op::Read { fail, next, char: _ } => {
-					*fail -= unused_count[*fail];
-					*next -= unused_count[*next];
+					if let Action::Next(fail) = fail {
+						*fail -= unused_count[*fail];
+					}
+					if let Action::Next(next) = next {
+						*next -= unused_count[*next];
+					}
 				}
 				Op::Test { table, fail } => {
-					*fail -= unused_count[*fail];
+					if let Action::Next(fail) = fail {
+						*fail -= unused_count[*fail];
+					}
 					for (_, next) in table.iter_mut() {
-						*next -= unused_count[*next];
+						if let Action::Next(next) = next {
+							*next -= unused_count[*next];
+						}
 					}
 				}
 			}
@@ -557,7 +761,11 @@ impl Builder {
 
 				let index = out.len();
 				let fail = index + 1;
-				out.push(Op::Read { char, next, fail });
+				out.push(Op::Read {
+					char,
+					next: Action::Next(next),
+					fail: Action::Next(fail),
+				});
 				index
 			}
 			_ => {
@@ -570,13 +778,16 @@ impl Builder {
 						input.push(char);
 						let next = self.compile_subtree(out, next, valid_output, valid_input, input, state_map);
 						input.pop();
-						(char, next)
+						(char, Action::Next(next))
 					})
 					.collect::<HashMap<_, _>>();
 
 				let index = out.len();
 				let fail = index + 1;
-				out.push(Op::Test { table, fail });
+				out.push(Op::Test {
+					table,
+					fail: Action::Next(fail),
+				});
 				index
 			}
 		};
